@@ -1,5 +1,5 @@
 ﻿# =============================================
-# AI Legal Contract Analyzer (FINAL FIXED VERSION)
+# AI Legal Contract Analyzer 
 # =============================================
 
 import streamlit as st
@@ -74,12 +74,20 @@ def split_into_clauses(text):
 # =============================================
 @st.cache_resource
 def load_models():
-    summarizer = pipeline(
-        "text2text-generation",          # ✅ NOT "summarization"
-        model="google/flan-t5-small"     # ✅ NOT "facebook/bart-large-cnn"
-    )
+    try:
+        summarizer = pipeline(
+            "text2text-generation",
+            model="google/flan-t5-small"
+        )
+    except KeyError:
+        # transformers>=5.0 no longer supports text2text-generation via pipeline;
+        # use text-generation with Flan-T5 by providing a prefix prompt.
+        summarizer = pipeline(
+            "text-generation",
+            model="google/flan-t5-small"
+        )
     similarity_model = SentenceTransformer("all-MiniLM-L6-v2")
-    return summarizer, similarity_model  # ✅ exactly 2 values
+    return summarizer, similarity_model
 
 # =============================================
 # SUMMARIZATION
@@ -344,3 +352,4 @@ else:
        - Compare contracts by semantic similarity
        - Generate a downloadable PDF report
     """)
+
