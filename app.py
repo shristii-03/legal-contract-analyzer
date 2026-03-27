@@ -1,22 +1,51 @@
-﻿import streamlit as st
+﻿# =============================================
+# AI Legal Contract Analyzer (FINAL FIXED VERSION)
+# =============================================
+
+import streamlit as st
 import fitz
 import pdfplumber
 import nltk
 import re
 import pandas as pd
 import plotly.express as px
+
+from transformers import pipeline
 from sentence_transformers import SentenceTransformer, util
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
-from sumy.parsers.plaintext import PlaintextParser
-from sumy.nlp.tokenizers import Tokenizer
-from sumy.summarizers.lsa import LsaSummarizer
-nltk.download("punkt", quiet=True)
-nltk.download("punkt_tab", quiet=True)
-nltk.download("stopwords", quiet=True)
-st.set_page_config(page_title="AI Legal Contract Analyzer", page_icon="⚖️", layout="wide")
+
+nltk.download('punkt', quiet=True)
+
+# =============================================
+# PAGE CONFIG
+# =============================================
+st.set_page_config(
+    page_title="AI Legal Contract Analyzer",
+    page_icon="⚖️",
+    layout="wide"
+)
+
+st.markdown("""
+    <style>
+        .main { background-color: #f8f9fa; }
+        .stButton>button {
+            background-color: #1a1a2e;
+            color: white;
+            border-radius: 8px;
+            padding: 0.5em 1.5em;
+        }
+        .risk-high { color: #e63946; font-weight: bold; }
+        .risk-medium { color: #f4a261; font-weight: bold; }
+        .risk-low { color: #2a9d8f; font-weight: bold; }
+    </style>
+""", unsafe_allow_html=True)
+
+# =============================================
+# TEXT EXTRACTION
+# =============================================
 def extract_text(file):
     text = ""
     try:
@@ -29,117 +58,289 @@ def extract_text(file):
             for page in pdf.pages:
                 text += page.extract_text() or ""
     return text
+
+# =============================================
+# CLAUSE SEGMENTATION
+# =============================================
 def split_into_clauses(text):
     pattern = r"(?:\n\d+\.\s|\n[A-Z ]{3,}\n|Section\s\d+|\n- )"
     parts = re.split(pattern, text)
     return [p.strip() for p in parts if len(p.strip()) > 50]
-def summarize(text):
-    try:
-        parser = PlaintextParser.from_string(text, Tokenizer("english"))
-        s = LsaSummarizer()
-        result = " ".join(str(x) for x in s(parser.document, 6))
-        return result if result.strip() else text[:500]
-    except:
-        return text[:500]
+
+# =============================================
+# LOAD MODELS
+# FIX: uses text2text-generation + flan-t5-small
+#      works on ALL transformers versions including 5.3.0
+# =============================================
 @st.cache_resource
-def load_similarity_model():
-    return SentenceTransformer("all-MiniLM-L6-v2")
+def load_models():
+    summarizer = pipeline(
+        "text2text-generation",          # ✅ NOT "summarization"
+        model="google/flan-t5-small"     # ✅ NOT "facebook/bart-large-cnn"
+    )
+    similarity_model = SentenceTransformer("all-MiniLM-L6-v2")
+    return summarizer, similarity_model  # ✅ exactly 2 values
+
+# =============================================
+# SUMMARIZATION
+# FIX: uses generated_text key, not summary_text
+# =============================================
+def summarize(text, summarizer):
+    text = text[:2000]
+    chunks = [text[i:i+400] for i in range(0, len(text), 400)]
+    summaries = []
+    for chunk in chunks[:4]:
+        if len(chunk.strip()) < 30:
+            continue
+        try:
+            result = summarizer(
+                f"summarize: {chunk}",   # ✅ flan-t5 needs this prefix
+                max_new_tokens=100,
+                do_sample=False
+            )
+            summaries.append(result[0]['generated_text'])  # ✅ NOT 'summary_text'
+        except Exception as e:
+            summaries.append(f"[Could not summarize: {e}]")
+    return " ".join(summaries) if summaries else "No summary available."
+
+# =============================================
+# ML-BASED RISK CLASSIFIER
+# =============================================
 @st.cache_resource
 def train_risk_model():
-    clauses = ["The party shall indemnify and be liable for all damages","Confidential information must not be disclosed","This agreement may be terminated under breach","Standard payment terms apply","The warranty period is limited","Either party may terminate with notice","The licensee shall not sublicense rights","Force majeure events suspend obligations","Intellectual property rights remain with owner","Penalty clause applies for non-performance"]
-    labels = ["HIGH","MEDIUM","HIGH","LOW","MEDIUM","LOW","MEDIUM","MEDIUM","HIGH","HIGH"]
-    v = TfidfVectorizer()
-    X = v.fit_transform(clauses)
-    m = LogisticRegression(max_iter=500)
-    m.fit(X, labels)
-    return m, v
+    clauses = [
+        "The party shall indemnify and be liable for all damages and penalties",
+        "Confidential information must not be disclosed to any third party",
+        "This agreement may be terminated immediately under breach of contract",
+        "Standard payment terms apply within 30 days of invoice",
+        "The warranty period is limited to 90 days from purchase",
+        "Governing law shall be the jurisdiction of the state of New York",
+        "Either party may terminate with 30 days written notice",
+        "The licensee shall not sublicense or transfer any rights",
+        "Force majeure events shall suspend obligations under this contract",
+        "Intellectual property rights remain with the original owner",
+    ]
+    labels = ["HIGH", "MEDIUM", "HIGH", "LOW", "MEDIUM",
+              "LOW", "LOW", "MEDIUM", "MEDIUM", "HIGH"]
+
+    vectorizer = TfidfVectorizer()
+    X = vectorizer.fit_transform(clauses)
+    model = LogisticRegression(max_iter=200)
+    model.fit(X, labels)
+    return model, vectorizer
+
 def predict_risk(clauses, model, vectorizer):
     if not clauses:
         return []
-    return model.predict(vectorizer.transform(clauses))
-def compute_similarity(c1, c2, model):
-    if not c1 or not c2:
+    X = vectorizer.transform(clauses)
+    return model.predict(X)
+
+# =============================================
+# SEMANTIC SIMILARITY
+# =============================================
+def compute_similarity(clauses1, clauses2, model):
+    if not clauses1 or not clauses2:
         return None
-    return util.cos_sim(model.encode(c1, convert_to_tensor=True), model.encode(c2, convert_to_tensor=True))
-def create_report(s1, s2, r1, r2, score):
-    from reportlab.pdfgen import canvas
-    from reportlab.lib.pagesizes import letter
-    c = canvas.Canvas("report.pdf", pagesize=letter)
-    w, h = letter
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(50, h-60, "AI Legal Contract Analysis Report")
-    y = h-100
-    for title, text in [("Contract A Summary:", s1), ("Contract B Summary:", s2)]:
+    emb1 = model.encode(clauses1, convert_to_tensor=True)
+    emb2 = model.encode(clauses2, convert_to_tensor=True)
+    return util.cos_sim(emb1, emb2)
+
+# =============================================
+# REPORT GENERATION
+# =============================================
+def create_report(summary1, summary2, risks1, risks2, sim_score, filename="report.pdf"):
+    c = canvas.Canvas(filename, pagesize=letter)
+    width, height = letter
+
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(50, height - 60, "AI Legal Contract Analysis Report")
+    c.setFont("Helvetica", 10)
+    c.drawString(50, height - 80, "Generated by AI Legal Contract Analyzer")
+
+    y = height - 120
+
+    def write_section(title, content):
+        nonlocal y
+        if y < 100:
+            c.showPage()
+            y = height - 60
         c.setFont("Helvetica-Bold", 12)
         c.drawString(50, y, title)
         y -= 20
         c.setFont("Helvetica", 9)
-        for chunk in [text[i:i+90] for i in range(0, min(len(text),900), 90)]:
-            c.drawString(60, y, chunk)
+        for line in content.split(". "):
+            line = line.strip()
+            if not line:
+                continue
+            while len(line) > 90:
+                c.drawString(60, y, line[:90])
+                line = line[90:]
+                y -= 14
+                if y < 100:
+                    c.showPage()
+                    y = height - 60
+            c.drawString(60, y, line + ".")
             y -= 14
-            if y < 80:
+            if y < 100:
                 c.showPage()
-                y = h-60
+                y = height - 60
         y -= 10
+
+    write_section("Contract A — Summary:", summary1)
+    write_section("Contract B — Summary:", summary2)
+
     c.setFont("Helvetica-Bold", 12)
-    c.drawString(50, y, "Risk Summary:")
-    y -= 18
+    c.drawString(50, y, "Risk Analysis:")
+    y -= 20
     c.setFont("Helvetica", 10)
-    for label, risks in [("Contract A", list(r1)), ("Contract B", list(r2))]:
-        c.drawString(60, y, f"{label} — HIGH: {risks.count('HIGH')}  MEDIUM: {risks.count('MEDIUM')}  LOW: {risks.count('LOW')}")
+    for label, risks in [("Contract A", risks1), ("Contract B", risks2)]:
+        risk_list = list(risks)
+        c.drawString(60, y,
+            f"{label} — HIGH: {risk_list.count('HIGH')}  "
+            f"MEDIUM: {risk_list.count('MEDIUM')}  "
+            f"LOW: {risk_list.count('LOW')}")
         y -= 16
+
+    y -= 10
     c.setFont("Helvetica-Bold", 12)
-    c.drawString(50, y-10, f"Similarity Score: {score:.3f}")
+    c.drawString(50, y, f"Semantic Similarity Score: {sim_score:.3f}")
     c.save()
-st.title("⚖️ AI Legal Contract Analyzer")
+
+# =============================================
+# UI
+# =============================================
+st.title("⚖️ AI Legal Contract Analyzer (ML Powered)")
+st.markdown("Upload two legal contracts (PDF) to compare, summarize, and detect risk clauses.")
+
 col1, col2 = st.columns(2)
 with col1:
-    file1 = st.file_uploader("Upload Contract A", type=["pdf"])
+    file1 = st.file_uploader("📄 Upload Contract A", type=["pdf"])
 with col2:
-    file2 = st.file_uploader("Upload Contract B", type=["pdf"])
+    file2 = st.file_uploader("📄 Upload Contract B", type=["pdf"])
+
 if file1 and file2:
-    st.success("Files uploaded!")
-    text1 = extract_text(file1)
-    text2 = extract_text(file2)
-    clauses1 = split_into_clauses(text1)
-    clauses2 = split_into_clauses(text2)
-    c1, c2 = st.columns(2)
-    c1.metric("Clauses A", len(clauses1))
-    c2.metric("Clauses B", len(clauses2))
-    with st.spinner("Loading models..."):
-        sim_model = load_similarity_model()
+    st.success("✅ Files uploaded successfully!")
+
+    with st.spinner("Extracting text from PDFs..."):
+        text1 = extract_text(file1)
+        text2 = extract_text(file2)
+
+    with st.spinner("Segmenting clauses..."):
+        clauses1 = split_into_clauses(text1)
+        clauses2 = split_into_clauses(text2)
+
+    col1, col2 = st.columns(2)
+    col1.metric("Clauses in Contract A", len(clauses1))
+    col2.metric("Clauses in Contract B", len(clauses2))
+
+    # ✅ Unpack exactly 2 values
+    with st.spinner("⏳ Loading AI models — first run downloads ~300MB, please wait..."):
+        summarizer, similarity_model = load_models()
         risk_model, vectorizer = train_risk_model()
-    with st.spinner("Summarizing..."):
-        s1 = summarize(text1)
-        s2 = summarize(text2)
-    st.subheader("Summaries")
-    c1, c2 = st.columns(2)
-    c1.info(s1)
-    c2.info(s2)
-    risks1 = predict_risk(clauses1, risk_model, vectorizer)
-    risks2 = predict_risk(clauses2, risk_model, vectorizer)
-    st.subheader("Risk Distribution")
-    df = pd.DataFrame({"Risk":["HIGH","MEDIUM","LOW"],"Contract A":[list(risks1).count("HIGH"),list(risks1).count("MEDIUM"),list(risks1).count("LOW")],"Contract B":[list(risks2).count("HIGH"),list(risks2).count("MEDIUM"),list(risks2).count("LOW")]})
-    st.plotly_chart(px.bar(df, x="Risk", y=["Contract A","Contract B"], barmode="group", color_discrete_sequence=["#e63946","#457b9d"]), use_container_width=True)
-    st.subheader("High Risk Clauses")
-    c1, c2 = st.columns(2)
-    with c1:
+
+    # ✅ Pass exactly 2 args
+    with st.spinner("Generating summaries..."):
+        summary1 = summarize(text1, summarizer)
+        summary2 = summarize(text2, summarizer)
+
+    st.subheader("📝 Summaries")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**Contract A Summary**")
+        st.info(summary1)
+    with col2:
+        st.markdown("**Contract B Summary**")
+        st.info(summary2)
+
+    with st.spinner("Running risk classification..."):
+        risks1 = predict_risk(clauses1, risk_model, vectorizer)
+        risks2 = predict_risk(clauses2, risk_model, vectorizer)
+
+    st.subheader("📊 Risk Distribution")
+    df = pd.DataFrame({
+        "Risk Level": ["HIGH", "MEDIUM", "LOW"],
+        "Contract A": [
+            list(risks1).count("HIGH"),
+            list(risks1).count("MEDIUM"),
+            list(risks1).count("LOW")
+        ],
+        "Contract B": [
+            list(risks2).count("HIGH"),
+            list(risks2).count("MEDIUM"),
+            list(risks2).count("LOW")
+        ]
+    })
+
+    fig = px.bar(
+        df,
+        x="Risk Level",
+        y=["Contract A", "Contract B"],
+        barmode="group",
+        color_discrete_sequence=["#e63946", "#457b9d"],
+        title="Risk Level Comparison"
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("🚨 Top HIGH Risk Clauses")
+    col1, col2 = st.columns(2)
+
+    with col1:
         st.markdown("**Contract A**")
-        hr1 = [c for c,r in zip(clauses1,risks1) if r=="HIGH"]
-        [st.error(f"• {c[:200]}...") for c in hr1[:5]] if hr1 else st.success("None found.")
-    with c2:
+        high_risk_1 = [c for c, r in zip(clauses1, risks1) if r == "HIGH"]
+        if high_risk_1:
+            for clause in high_risk_1[:5]:
+                st.error(f"• {clause[:200]}...")
+        else:
+            st.success("No HIGH risk clauses found.")
+
+    with col2:
         st.markdown("**Contract B**")
-        hr2 = [c for c,r in zip(clauses2,risks2) if r=="HIGH"]
-        [st.error(f"• {c[:200]}...") for c in hr2[:5]] if hr2 else st.success("None found.")
-    sim = compute_similarity(clauses1[:20], clauses2[:20], sim_model)
-    score = sim.mean().item() if sim is not None else 0.0
-    st.subheader("Similarity Score")
-    st.metric("Cosine Similarity", f"{score:.3f}")
-    if st.button("Download Report"):
-        create_report(s1, s2, risks1, risks2, score)
-        with open("report.pdf","rb") as f:
-            st.download_button("Download PDF", f, file_name="report.pdf")
+        high_risk_2 = [c for c, r in zip(clauses2, risks2) if r == "HIGH"]
+        if high_risk_2:
+            for clause in high_risk_2[:5]:
+                st.error(f"• {clause[:200]}...")
+        else:
+            st.success("No HIGH risk clauses found.")
+
+    with st.spinner("Computing semantic similarity..."):
+        sim = compute_similarity(clauses1[:20], clauses2[:20], similarity_model)
+
+    sim_score = sim.mean().item() if sim is not None else 0.0
+
+    st.subheader("🔗 Semantic Similarity Score")
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.metric(
+            label="Cosine Similarity (0 = different, 1 = identical)",
+            value=f"{sim_score:.3f}",
+            delta="High similarity" if sim_score > 0.7
+                  else ("Moderate" if sim_score > 0.4 else "Low similarity")
+        )
+
+    st.subheader("📥 Download Report")
+    if st.button("Generate & Download PDF Report"):
+        with st.spinner("Creating report..."):
+            create_report(summary1, summary2, risks1, risks2, sim_score)
+        with open("report.pdf", "rb") as f:
+            st.download_button(
+                label="⬇️ Download PDF Report",
+                data=f,
+                file_name="contract_analysis_report.pdf",
+                mime="application/pdf"
+            )
+
 elif file1 or file2:
-    st.warning("Please upload both contracts.")
+    st.warning("⚠️ Please upload **both** contracts to begin analysis.")
+
 else:
-    st.info("Upload two PDF contracts above to begin analysis.")
+    st.markdown("""
+    ### How to use:
+    1. Upload **Contract A** (PDF)
+    2. Upload **Contract B** (PDF)
+    3. The system will automatically:
+       - Extract and segment clauses
+       - Summarize each contract
+       - Classify risk levels (HIGH / MEDIUM / LOW)
+       - Compare contracts by semantic similarity
+       - Generate a downloadable PDF report
+    """)
