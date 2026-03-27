@@ -1,0 +1,10 @@
+streamlit
+pymupdf
+pdfplumber
+nltk
+transformers
+sentence-transformers
+torch
+plotly
+reportlab
+pandas
